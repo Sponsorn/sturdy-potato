@@ -1,7 +1,7 @@
 # NaowhQOL Code Review
 
 **Version:** v0.1.0 BETA
-**Interface:** 120000 (Retail TWW), 110207 (Classic)
+**Interface:** 120000 (Retail TWW 12.0), 110207 (Retail TWW 11.0.7)
 **Review Date:** 2026-02-08
 **Verified Against:** Blizzard WoW UI Source v12.0.0.65655 (TWW)
 
@@ -15,107 +15,12 @@ The codebase is functional and ambitious but has several categories of issues ra
 
 ---
 
-## CRITICAL / HIGH Severity
-
-### 3. FocusCastBar Uses TWW "Secret Value" APIs
-**File:** `Modules/FocusCastBarDisplay.lua` lines 108-131, 278-282
-
-```lua
-local cooldownDuration = C_Spell.GetSpellCooldownDuration(spellId)
-local isReady = cooldownDuration:IsZero()
-barTexture:SetVertexColorFromBoolean(isReady, readyColor, cdColor)
-castBarFrame:SetAlphaFromBoolean(currentNotInterruptible, 0, 1)
-local duration = UnitCastingDuration("focus")
-progressBar:SetTimerDuration(duration, ...)
-```
-These are Blizzard's "opaque value" APIs designed to prevent cooldown/casting info leaking in PvP. They are documented in Blizzard's `APIDocumentationGenerated` source (e.g. `SpellDocumentation.lua`, `SimpleRegionAPIDocumentation.lua`, `UnitDocumentation.lua`) with `SecretArguments` and `SecretReturns` markers. They are official Mainline-only APIs and will not exist on Classic clients. The TOC declares `## Interface: 110207` (Classic support), where these APIs will produce hard errors.
-
----
-
-### 4. TOC Claims Classic Support But Modules Use Retail-Only APIs
-**File:** `NaowhQOL.toc` line 1
-
-The TOC specifies `## Interface: 120000, 110207` -- both Retail TWW and Classic. However, many Retail-only APIs are used without compatibility checks:
-- `C_UnitAuras.GetAuraDataByIndex` (BuffMonitor, ConsumableChecker, DisplayUtils)
-- `C_Spell.GetSpellCharges`, `C_Spell.GetSpellCooldown` (Dragonriding, GcdTracker)
-- `C_PlayerInfo.GetGlidingInfo` (Dragonriding)
-- `C_ChallengeMode.*` (AutoKeystone, CombatLogger)
-- `C_AddOns.GetNumAddOns` (Profiler)
-- `GetSpecialization`, `GetSpecializationInfo` (SpecUtil, StealthReminder)
-- `ColorPickerFrame:SetupColorPickerAndShow` (Widgets -- introduced in 10.2.5)
-
-Loading on the Classic client (110207) would produce immediate Lua errors in multiple modules. None of these APIs have fallback checks or `pcall` guards.
-
----
-
 ## MEDIUM Severity
-
-### 5. `MaxSpellQueueWindow` Is Not a Valid CVar
-**File:** `Core.lua:555`
-
-```lua
-SetCVar("MaxSpellQueueWindow", 150)
-```
-This CVar does not exist in Blizzard's source. `SpellQueueWindow` (set on line 553) is the correct one. This call silently fails or throws an error depending on the client version.
-
----
-
-### 7. Buff Tracker Reset Popup Nils the Wrong Key
-**File:** `Data/StaticPopups.lua:74`
-
-```lua
-NaowhQOL.buffTracker = nil  -- should be NaowhQOL.buffMonitor
-```
-The buff tracker was migrated to `buffMonitor` (see Core.lua lines 166-172). Clicking the reset popup nils a key that may no longer exist and does NOT reset the current buff monitor settings. The user thinks they reset their settings, but nothing happens.
-
----
 
 ### 8. Deprecated `UIDropDownMenuTemplate` -- Taint Risk
 **File:** `Data/Widgets.lua` lines 327-361
 
 The entire legacy dropdown system (`UIDropDownMenu_SetWidth`, `UIDropDownMenu_Initialize`, `UIDropDownMenu_AddButton`, etc.) was deprecated in WoW 10.0. It still works via a compatibility layer (`Blizzard_SharedXML/Mainline/UIDropDownMenu.lua`), but is known to cause taint when interacted with during or shortly after combat, leading to "action blocked" errors. The modern replacement is `MenuUtil` (used in 10+ Blizzard UI files).
-
----
-
-### 9. `SetUserPlaced(true)` Conflicts With Addon Position Saving
-**File:** `Data/Widgets.lua:1207`
-
-`SetUserPlaced(true)` tells WoW to save/restore frame positions via `layout-local.txt`. This competes with the addon's own position saving in `OnDragStop`. On login, WoW restores the frame to its `layout-local.txt` position, then the addon re-applies from SavedVariables. This causes visible frame "jumping" and the wrong position can win.
-
----
-
-### 10. O(n^2) `ClearFrame` Implementation
-**File:** `Data/Widgets.lua:286`
-
-```lua
-for i = 1, frame:GetNumChildren() do
-    local child = select(i, frame:GetChildren())
-```
-Each `select(i, frame:GetChildren())` rebuilds the full vararg and scans to position i. For frames with many children, this is measurably slow. Should use `{frame:GetChildren()}` + `ipairs`.
-
----
-
-### 11. O(n) LRU Cache Scan on Every Hit
-**File:** `Data/DisplayUtils.lua` lines 17-24
-
-```lua
-for i, id in ipairs(cacheOrder) do
-    if id == spellId then
-        table.remove(cacheOrder, i)  -- O(n) shift
-```
-On every cache hit, up to 100 entries are linearly scanned and shifted. For a hot path during aura display updates, this adds up. Should use a hash-map indexed approach.
-
----
-
-### 12. CombatLogger Potential Nil Dereference
-**File:** `Modules/CombatLoggerDisplay.lua:151`
-
-```lua
-C_Timer.After(0.5, function()
-    OnZoneChanged(ns.ZoneUtil.GetCurrentZone())
-end)
-```
-If `GetCurrentZone()` returns nil, `OnZoneChanged` tries to access `zoneData.instanceType` which throws "attempt to index a nil value". The 0.5s delay mitigates but doesn't guarantee zone data is ready.
 
 ---
 
@@ -127,18 +32,6 @@ Multiple features use `hooksecurefunc` or `UnregisterAllEvents` which are irreve
 - TalkingHead suppression (`hooksecurefunc(TalkingHeadFrame, "Show", ...)`) -- permanent
 - Zone text suppression (`frame:SetScript("OnShow", frame.Hide)`) -- permanent
 - Loot warning events registered once at login, never unregistered
-
----
-
-### 14. GcdTracker Spellcast Events Not Unit-Filtered (Performance Only)
-**File:** `Modules/GcdTrackerDisplay.lua` lines 484-489
-
-```lua
-eventFrame:RegisterEvent("UNIT_SPELLCAST_START")
-eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
--- etc.
-```
-These fire for ALL units. In a 20-player raid, these fire many times per second. The handler correctly filters `unit ~= "player"`, so **this is functionally safe** -- but the dispatch overhead remains. Should use `RegisterUnitEvent("UNIT_SPELLCAST_START", "player")` for efficiency.
 
 ---
 
@@ -164,72 +57,10 @@ Shapeshift form indices are determined by `GetShapeshiftFormInfo` order, which h
 
 ---
 
-### 18. CVar Case Mismatch [UNVERIFIED]
-**File:** `Config/Optimizations.lua`
-
-```lua
-SetCVar("sunshafts", "0")  -- line 569, lowercase 's'
--- but elsewhere:
-["sunShafts"] = "2",        -- line 748, capital 'S'
-```
-CVar names can be case-sensitive. If the CVar is actually `sunShafts`, the lowercase `SetCVar` silently fails.
-
-**Note:** Neither `sunshafts` nor `sunShafts` appears in the Blizzard UI source (CVars are defined in the engine, not UI code). This claim cannot be verified from the UI source alone.
-
----
-
-### 19. LowEndOptimization Sets CVars Not Tracked by SaveCurrentSettings
-**File:** `Config/Optimizations.lua`
-
-`SaveCurrentSettings()` (line 254) iterates over `OPTIMAL_FPS_CVARS` to save current values. But the low-end optimization path sets additional CVars NOT in that table:
-- `graphicsTextureQuality` (line 507)
-- `graphicsTextureFiltering` (line 550)
-- `lightingQuality` (line 575)
-- `maxFPSLoading` (line 582)
-
-If a user applies Low-End mode then clicks Revert, these CVars are NOT restored.
-
----
-
-### 20. Profiler AVG and MAX Columns Show Identical Data
-**File:** `Config/Profiler.lua` lines 287, 292
-
-```lua
-rows[i].avg:SetText(format("%.3f", data[i].c))
-rows[i].peak:SetText(format("%.2f", data[i].c))
-```
-Both columns display `data[i].c` from `GetAddOnCPUUsage(i)`. The headers say "CPU AVG" and "CPU MAX" but they show the same value with different decimal precision.
-
----
-
-### 22. Emote Detection Content Height Immediately Overwritten
-**File:** `Config/EmoteDetection.lua` lines 393 vs 400
-
-`BuildAutoEmoteList()` dynamically calculates content height (line 393), then immediately after, line 400 overwrites it to a static 200px. The initial render always uses 200px regardless of actual content count.
-
----
-
-### 23. `GroupUtil` Passes Mutable `cachedClasses` to Callbacks
-**File:** `Data/GroupUtil.lua:40`
-
-```lua
-pcall(fn, cachedClasses)
-```
-Callbacks receive a direct reference to the internal cache. A misbehaving callback could mutate this table, corrupting state for all other consumers.
-
----
-
 ### 24. ZoneUtil Retry Fires Callbacks With Potentially Invalid Data
 **File:** `Data/ZoneUtil.lua:114`
 
 When retries are exhausted and zone info is still unresolved (difficulty 0 inside an instance), `NotifyCallbacks()` fires with incorrect data. Consumers may misidentify dungeon difficulty.
-
----
-
-### 25. AutoKeystone Missing Nil Check on C_Item.GetItemInfo
-**File:** `Modules/AutoKeystone.lua:15`
-
-`C_Item.GetItemInfo` returns nil when item data hasn't been cached from the server. No retry mechanism exists (should use `GET_ITEM_INFO_RECEIVED`). The keystone is silently never slotted on cold login.
 
 ---
 
@@ -250,23 +81,6 @@ All have OnUpdate scripts that run every frame even when the feature is disabled
 
 ---
 
-### 30. ConsumableChecker `SetAttribute` With String Instead of Number
-**File:** `Modules/ConsumableCheckerDisplay.lua:389`
-
-```lua
-slot.click:SetAttribute("target-slot", tostring(m.targetSlot))
-```
-The `target-slot` attribute expects a number. String coercion may cause weapon enchant items to fail to target the correct slot.
-
----
-
-### 31. Main Frame Not Clamped to Screen
-**File:** `UI/MainFrame.lua` lines 7-15
-
-`SetClampedToScreen(true)` is never called. The 950x650 settings window can be dragged entirely off-screen with no way to retrieve it (except `/reload` which resets to center).
-
----
-
 ### 32. Dual/Inconsistent Color Definitions Across Files
 Colors are defined independently with different values in `Core.lua`, `Data/Widgets.lua`, `UI/Sidebar.lua`, and `UI/MainFrame.lua`. The addon's "orange" is `ffa900` in one place, `{255/255, 169/255, 0}` in another, and `{1.00, 0.66, 0.00}` in a third -- these are mathematically different colors.
 
@@ -276,17 +90,6 @@ Colors are defined independently with different values in `Core.lua`, `Data/Widg
 **Files:** `Data/BarStyleList.lua:78-79`, `Data/FontList.lua:115-116`
 
 `Rebuild()` and `HookLSM()` run before `ADDON_LOADED`. LibSharedMedia may not be fully populated yet. The initial list only contains built-in entries; LSM-registered entries from other addons are missing until the first registration callback.
-
----
-
-### 34. `SetCVar`/`GetCVar` Local Cache Asymmetry
-**File:** `Config/Optimizations.lua` lines 241-242
-
-```lua
-local SetCVar = SetCVar
-local GetCVar = GetCVar
-```
-These are declared AFTER `SaveCurrentSettings` (defined at line 254), which captures the global versions. Functions after line 242 use the locals. If any addon hooks `SetCVar` globally, the save function sees the hook but the apply functions do not.
 
 ---
 
@@ -341,19 +144,14 @@ All settings live in a single global `NaowhQOL` table with flat keys per module.
 
 | Severity | Count | Notes |
 |----------|-------|-------|
-| Critical / High | 2 | #3/#4 (Classic API incompatibility) |
-| Medium | 14 | Verified issues |
-| Low | 7 | Minor issues |
+| Medium | 5 | #8, #13, #16, #17, #24 |
+| Low | 4 | #26, #27, #32, #33 |
 | Dead Code / Orphaned Files | 7 files (~1,937 lines) | |
 
 ### Top Priority Fixes
-1. **Fix buff tracker reset popup** to nil `NaowhQOL.buffMonitor` instead of `NaowhQOL.buffTracker`
-2. **Remove `MaxSpellQueueWindow` CVar call** -- invalid CVar name
-3. **Add `RegisterUnitEvent` filtering** for GCD tracker spellcast events -- performance in group content
-4. **Replace deprecated `UIDropDownMenuTemplate`** with `MenuUtil` -- taint risk in combat
-5. **Remove 7 orphaned files** -- nearly 2,000 lines of dead code
-6. **Add Classic API guards or remove Classic interface version** -- Retail-only APIs will error on Classic
-7. **Migrate deprecated templates** (`InterfaceOptionsCheckButtonTemplate`, `UIDropDownMenuTemplate`) -- functional but deprecated
+1. **Replace deprecated `UIDropDownMenuTemplate`** with `MenuUtil` -- taint risk in combat
+2. **Remove 7 orphaned files** -- nearly 2,000 lines of dead code
+3. **Migrate deprecated templates** (`InterfaceOptionsCheckButtonTemplate`, `UIDropDownMenuTemplate`) -- functional but deprecated
 
 ---
 
@@ -381,6 +179,96 @@ The following bugs were identified in Review #1 and have been fixed in the curre
 
 ---
 
+### ~~#5. `MaxSpellQueueWindow` Is Not a Valid CVar~~ -- FIXED
+**File:** `Core.lua`
+
+**Original bug:** `SetCVar("MaxSpellQueueWindow", 150)` -- this CVar does not exist. `SpellQueueWindow` is the correct one.
+
+**Status:** The invalid `MaxSpellQueueWindow` line has been removed.
+
+---
+
+### ~~#7. Buff Tracker Reset Popup Nils the Wrong Key~~ -- FIXED
+**File:** `Data/StaticPopups.lua`
+
+**Original bug:** `NaowhQOL.buffTracker = nil` should be `NaowhQOL.buffMonitor` after the buff tracker migration.
+
+**Status:** Changed to `NaowhQOL.buffMonitor = nil`.
+
+---
+
+### ~~#9. `SetUserPlaced(true)` Conflicts With Addon Position Saving~~ -- FIXED
+**File:** `Data/Widgets.lua`
+
+**Original bug:** `SetUserPlaced(true)` competes with the addon's own position saving in `OnDragStop`, causing frame jumping on login.
+
+**Status:** `SetUserPlaced(true)` removed from `MakeDraggable`.
+
+---
+
+### ~~#10. O(n^2) `ClearFrame` Implementation~~ -- FIXED
+**File:** `Data/Widgets.lua`
+
+**Original bug:** `select(i, frame:GetChildren())` in a loop rebuilds the full vararg each iteration.
+
+**Status:** Now uses `{frame:GetChildren()}` + `ipairs` for O(n) performance.
+
+---
+
+### ~~#11. O(n) LRU Cache Scan on Every Hit~~ -- FIXED
+**File:** `Data/DisplayUtils.lua`
+
+**Original bug:** Linear scan of up to 100 entries on every cache hit.
+
+**Status:** Added `cachePos` hash map for O(1) position lookup.
+
+---
+
+### ~~#12. CombatLogger Potential Nil Dereference~~ -- FIXED
+**File:** `Modules/CombatLoggerDisplay.lua`
+
+**Original bug:** `OnZoneChanged(ns.ZoneUtil.GetCurrentZone())` could pass nil, crashing on `zoneData.instanceType`.
+
+**Status:** Added nil guard: only calls `OnZoneChanged` if `GetCurrentZone()` returns non-nil.
+
+---
+
+### ~~#14. GcdTracker Spellcast Events Not Unit-Filtered~~ -- FIXED
+**File:** `Modules/GcdTrackerDisplay.lua`
+
+**Original bug:** 6 `UNIT_SPELLCAST_*` events fired for all units; handler filtered to player but dispatch overhead remained.
+
+**Status:** Changed to `RegisterUnitEvent("UNIT_SPELLCAST_*", "player")` for all 6 events.
+
+---
+
+### ~~#18. CVar Case Mismatch~~ -- FIXED
+**File:** `Config/Optimizations.lua`
+
+**Original bug:** `SetCVar("sunshafts", "0")` lowercase vs `["sunShafts"]` elsewhere.
+
+**Status:** Changed to `SetCVar("sunShafts", "0")` for consistency.
+
+---
+
+### ~~#19. LowEndOptimization Sets CVars Not Tracked by SaveCurrentSettings~~ -- FIXED
+**File:** `Config/Optimizations.lua`
+
+**Original bug:** 4 CVars set by low-end mode were not in `OPTIMAL_FPS_CVARS`, so revert didn't restore them.
+
+**Status:** Added `graphicsTextureQuality`, `graphicsTextureFiltering`, `lightingQuality`, `maxFPSLoading` to `OPTIMAL_FPS_CVARS`.
+
+---
+
+### ~~#20. Profiler AVG and MAX Columns Show Identical Data~~ -- FIXED
+**File:** `Config/Profiler.lua`
+
+**Original bug:** Both columns displayed `data[i].c` from `GetAddOnCPUUsage(i)`.
+
+**Status:** Added `peakCPU` tracking table. AVG column shows current CPU, MAX column shows peak CPU since last reset.
+
+---
+
 ### ~~#21. MouseCursor `gcdReadyRing` Not Cleaned Up on Zone Change~~ -- FIXED
 **File:** `Config/MouseCursor.lua:1349`
 
@@ -390,12 +278,66 @@ The following bugs were identified in Review #1 and have been fixed in the curre
 
 ---
 
+### ~~#22. Emote Detection Content Height Immediately Overwritten~~ -- FIXED
+**File:** `Config/EmoteDetection.lua`
+
+**Original bug:** `BuildAutoEmoteList()` dynamically calculates content height, then line 400 immediately overwrites it to static 200px.
+
+**Status:** Removed the static `SetHeight(200)` and `RecalcHeight()` overwrite.
+
+---
+
+### ~~#23. `GroupUtil` Passes Mutable `cachedClasses` to Callbacks~~ -- FIXED
+**File:** `Data/GroupUtil.lua`
+
+**Original bug:** Callbacks received a direct reference to the internal cache table; mutations corrupted shared state.
+
+**Status:** Callbacks now receive a shallow copy of `cachedClasses`.
+
+---
+
+### ~~#25. AutoKeystone Missing Nil Check on C_Item.GetItemInfo~~ -- FIXED
+**File:** `Modules/AutoKeystone.lua`
+
+**Original bug:** `C_Item.GetItemInfo` returns nil when item data isn't cached. No retry mechanism existed.
+
+**Status:** Added `GET_ITEM_INFO_RECEIVED` retry. When item data is nil, a one-shot event listener retries `TrySlotKeystone`.
+
+---
+
 ### ~~#28. `SafeSetCVar` Defined But Never Called~~ -- FIXED
 **File:** `Config/Optimizations.lua`
 
 **Original bug:** A `SafeSetCVar` wrapper function was defined but never called anywhere in the codebase.
 
 **Status:** The dead function has been removed.
+
+---
+
+### ~~#30. ConsumableChecker `SetAttribute` With String Instead of Number~~ -- FIXED
+**File:** `Modules/ConsumableCheckerDisplay.lua`
+
+**Original bug:** `tostring(m.targetSlot)` passed a string to `target-slot` attribute which expects a number.
+
+**Status:** Removed `tostring()` wrapper, now passes `m.targetSlot` directly as a number.
+
+---
+
+### ~~#31. Main Frame Not Clamped to Screen~~ -- FIXED
+**File:** `UI/MainFrame.lua`
+
+**Original bug:** The 950x650 settings window could be dragged entirely off-screen.
+
+**Status:** Added `SetClampedToScreen(true)`.
+
+---
+
+### ~~#34. `SetCVar`/`GetCVar` Local Cache Asymmetry~~ -- FIXED
+**File:** `Config/Optimizations.lua`
+
+**Original bug:** `local SetCVar = SetCVar` / `local GetCVar = GetCVar` were declared after `SaveCurrentSettings`, causing asymmetric behavior.
+
+**Status:** Moved `SetCVar`/`GetCVar` locals to the top of the file, before any function definitions.
 
 ---
 
@@ -411,6 +353,24 @@ The following items from the original review were found to be incorrect, oversta
 **Original claim:** This template was removed in WoW 10.0 (Dragonflight) and crashes with `Couldn't find inherited node`.
 
 **Correction:** This template was NOT removed. It still exists in `Blizzard_FrameXML/DeprecatedTemplates.xml` (line 34) and is loaded on Mainline via `Blizzard_FrameXML_Mainline.toc` (lines 25-26). It inherits from `OptionsBaseCheckButtonTemplate`. The template is deprecated but fully functional -- no crash occurs. Migrating to a modern template is good practice but not urgent.
+
+---
+
+### ~~#3. FocusCastBar Uses TWW "Secret Value" APIs (claimed Classic incompatible)~~ -- INCORRECT
+**File:** `Modules/FocusCastBarDisplay.lua`
+
+**Original claim:** These "opaque value" APIs (`GetSpellCooldownDuration`, `SetVertexColorFromBoolean`, `UnitCastingDuration`, etc.) would produce hard errors on Classic because the TOC declares `## Interface: 110207` as Classic support.
+
+**Correction:** `110207` is Retail TWW 11.0.2 (previous expansion patch), NOT Classic. Both `120000` and `110207` are Retail interface versions. All these APIs exist on both versions. There is no Classic incompatibility.
+
+---
+
+### ~~#4. TOC Claims Classic Support But Modules Use Retail-Only APIs~~ -- INCORRECT
+**File:** `NaowhQOL.toc`
+
+**Original claim:** The TOC specifies both Retail TWW and Classic (`110207`), and many Retail-only APIs would produce errors on the Classic client.
+
+**Correction:** `110207` is Retail TWW 11.0.2, NOT Classic. The TOC declares two Retail interface versions for backwards compatibility. All listed APIs (`C_UnitAuras.GetAuraDataByIndex`, `C_Spell.*`, `C_ChallengeMode.*`, `GetSpecialization`, etc.) exist on both Retail versions. There is no Classic client issue.
 
 ---
 
